@@ -1,0 +1,6 @@
+[submodule "_reference/RFCs"]
+	path = _reference/RFCs
+	url = https://github.com/ajeskey/RFCs.git
+[submodule "_reference/anml-server-rust"]
+	path = _reference/anml-server-rust
+	url = https://github.com/Life-Savor-AI/anml-server-rust.git
