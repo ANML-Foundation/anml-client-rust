@@ -1,0 +1,43 @@
+[package]
+name = "anml-client"
+version = "0.1.0-alpha.1"
+edition = "2021"
+rust-version = "1.80"
+license = "ISC"
+description = "RFC-compliant ANML 1.0 client library for Rust"
+repository = "https://github.com/Life-Savor-AI/anml-client-rust"
+keywords = ["anml", "agent", "client", "protocol", "xml"]
+categories = ["web-programming::http-client", "web-programming"]
+
+[features]
+default = ["serde"]
+dns-sd = []
+html-discovery = []
+cache = []
+blocking = []
+testing = ["dep:axum"]
+serde = ["dep:serde", "dep:serde_json"]
+wasm = []
+
+[dependencies]
+anml = { git = "https://github.com/Life-Savor-AI/anml-server-rust.git", features = ["serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+thiserror = "2"
+url = "2"
+sha2 = "0.10"
+hmac = "0.12"
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
+rand = "0.8"
+tracing = "0.1"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+axum = { version = "0.7", optional = true }
+
+[dev-dependencies]
+proptest = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
+trybuild = "1"
+axum = "0.7"
