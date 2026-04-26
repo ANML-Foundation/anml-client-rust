@@ -2,380 +2,330 @@
 
 ## Overview
 
-Build `anml-client`, an RFC-compliant Rust crate that makes it easy for users (developers building agents) to interact with ANML documents served over HTTP(S). The client is the consumer-side counterpart to the `anml` server crate (`anml-server-rust`), reusing its types, parser, serializer, and builder rather than reimplementing them.
+Build `anml-client`, an RFC-compliant Rust crate that makes it easy for developers building agents to interact with ANML documents served over HTTP(S). The client is the consumer-side counterpart to the `anml` server crate, reusing its types, parser, serializer, and builder rather than reimplementing them. All client code is self-contained in this repository.
 
 Reference documents:
 - #[[file:_reference/RFCs/ANML/draft-jeskey-anml-00.xml]] (the ANML 1.0 Internet-Draft)
 - #[[file:_reference/RFCs/ANML/anml.xsd]] (normative XML Schema)
 - #[[file:_reference/anml-server-rust/ARCHITECTURE.md]] (server crate architecture)
 
-## Functional Requirements
+---
 
-### FR-1: Service Discovery
+## 0. User Stories
+
+- As a developer building an agent, I want to discover an ANML service from just a domain name, so I can start interacting without knowing the exact endpoint.
+  - Acceptance: `client.discover("example.com")` returns a `DiscoveryResult` with the ANML endpoint URL, trying well-known URI, Link header, HTML link, and DNS-SD in order.
+- As a developer, I want to fetch an ANML document and inspect what the service is asking for, what actions are available, and what constraints apply, before deciding what to disclose.
+  - Acceptance: `client.fetch("/service")` returns an `AnmlDocument` with accessors for all sections. No side effects occur from fetching alone.
+- As a developer, I want the client to automatically enforce disclosure rules so I can't accidentally leak user data without proper consent.
+  - Acceptance: calling `build_answer()` or `execute_action()` with answer values runs the full 7-step disclosure algorithm. If any step fails, a `<refuse>` is emitted instead of an `<answer>`. There is no code path that bypasses disclosure evaluation.
+- As a developer, I want to execute a multi-step flow (e.g., search → select → pay → confirm) and have the client track state for me.
+  - Acceptance: `FlowNavigator` tracks current step, handles `next-on-error` transitions, enforces `retry-budget`, and updates state from service responses. `flow.advance(params)` executes the current step's action and returns the next document.
+- As a developer, I want to answer an `<ask>` and have the client handle consent checking, tokenization, parameter encoding, and idempotency keys automatically.
+  - Acceptance: `client.action(&doc, "submit-airline").param("airline", "Delta").execute()` runs disclosure, encodes params per the action's enctype, attaches Idempotency-Key if needed, and returns the parsed response.
+- As a developer, I want clear compile-time errors when I forget a required parameter, not runtime surprises.
+  - Acceptance: `client.action(&doc, "submit-reason").execute()` fails to compile if `<param name="reason" required="true">` has not been set via `.param("reason", ...)`.
+- As a developer, I want to plug in my own auth provider, trust policy, and consent handler without forking the library.
+  - Acceptance: `AnmlClient::builder().trust_policy(my_policy).auth_provider(my_auth).consent_handler(my_handler).build()` compiles and works with any implementation of the respective traits.
+- As a developer, I want to write integration tests against a mock ANML server without spinning up real infrastructure.
+  - Acceptance: `MockAnmlServer::new().document("/service", fixture).build()` starts an in-process HTTP server. Tests run in <1s with no network I/O.
+
+---
+
+## 1. Functional Requirements
+
+### 1.1 Service Discovery
 The client MUST support all four RFC-defined discovery mechanisms:
 1. Well-known URI (`/.well-known/anml`) — fetch and parse the manifest document.
 2. HTTP Link header (`rel="alternate" type="application/anml+xml"`) — extract ANML endpoint from any HTTP response.
-3. HTML `<link>` element — parse an HTML page for `<link rel="alternate" type="application/anml+xml">`.
-4. DNS-SD (`_anml._tcp` SRV + TXT `v=anml1`) — resolve service location from DNS.
+3. HTML `<link>` element (feature-gated `html-discovery`) — parse HTML for `<link rel="alternate" type="application/anml+xml">`.
+4. DNS-SD (feature-gated `dns-sd`) — resolve `_anml._tcp` SRV + TXT `v=anml1` via pure-Rust DNS resolver.
 
-### FR-2: Document Fetching & Parsing
-- The client MUST fetch ANML documents over HTTP(S) with `Accept: application/anml+xml`.
-- The client MUST delegate parsing to the `anml` crate's `parser::parse()`.
-- The client MUST validate `Content-Type: application/anml+xml` on responses.
-- The client MUST support encoding detection per RFC precedence: HTTP charset > XML decl > BOM > UTF-8 default.
+### 1.2 Document Fetching, Parsing & Negotiation
+- Fetch ANML documents over HTTP(S) with `Accept: application/anml+xml; version="1.0"` (configurable).
+- Validate `Content-Type: application/anml+xml` before parsing; reject non-ANML payloads with a typed error.
+- Delegate parsing to the `anml` crate's `parser::parse()`.
+- Support encoding detection per RFC precedence: HTTP charset > XML decl > BOM > UTF-8 default.
+- Handle HTTP 406 (Not Acceptable) with structured `unsupported-version` problem parsing.
+- Read `anml/@version` and `anml/@supported-versions` from fetched documents.
 
-### FR-3: Content & Version Negotiation
-- The client MUST send `Accept: application/anml+xml; version="1.0"` (configurable).
-- The client MUST handle HTTP 406 (Not Acceptable) with a structured `unsupported-version` problem.
-- The client MUST read `anml/@version` and `anml/@supported-versions` from fetched documents.
+### 1.3 Document Inspection
+Provide ergonomic accessors for all top-level ANML sections: head, constraints, state, interact, knowledge, persona, aesthetic, body, footer, status.
 
-### FR-4: Document Inspection
-The client MUST provide ergonomic accessors for all top-level ANML sections:
-- `head` (title, meta)
-- `constraints` (disclosure rules)
-- `state` (context, flow, steps)
-- `interact` (actions, params, options, responses)
-- `knowledge` (inform, ask)
-- `persona`, `aesthetic`
-- `body` (sections, data, items, fields, nav, media)
-- `footer` (rights, attribution)
-- `status` (code, result, problem)
+### 1.4 Disclosure Evaluation
 
-### FR-5: Disclosure Evaluation
-- The client MUST implement the RFC disclosure evaluation algorithm (Section 8.5).
-- Before emitting any `<answer>`, the client MUST evaluate the `<constraints>` section.
-- The client MUST support disclosure matching: exact `field`, `field-prefix`, `field-pattern`, and `default="true"` with the RFC-defined precedence.
-- The client MUST support `requires` values: `explicit`, `implicit`, `authentication`, `none`.
-- The client MUST support `consent-scope`: `session`, `origin`, `global`.
-- The client MUST support `rate-limit` enforcement.
-- The client MUST support `tokenize` flag.
-- Missing disclosure rules for an `<ask>` MUST be treated as `requires="explicit"` with `consent-scope="session"`.
+The client MUST implement the RFC disclosure evaluation algorithm exactly as specified in Section 8.5. The algorithm is executed for every `<answer>` the client prepares to emit. The 7 steps are:
 
-### FR-6: Action Execution
-- The client MUST execute actions defined in `<interact>` by performing the HTTP request specified by `method` and `endpoint`.
-- The client MUST implement the parameter binding algorithm (Section 10.9) for all three enctypes:
-  - `application/x-www-form-urlencoded`
-  - `multipart/form-data`
-  - `application/json`
-- The client MUST support parameter validation (type, required, pattern, min, max, enum options).
-- The client MUST respect `auth` (none/required/optional) and `confirm` (prompt user before executing).
-- The client MUST support `idempotent` actions with `Idempotency-Key` header generation and retry semantics per RFC Section 8.6.
+1. **Resolve the rule.** Find the `<disclosure>` in `<constraints>` whose `field` matches the answer's field, using the matching precedence defined in 1.4.1. If no rule matches, synthesize `requires="explicit"` + `consent-scope="session"` and log a policy-quality warning.
+2. **Check rate limit.** If the rule has `rate-limit`, verify the (field, origin) pair has not exceeded the limit in the trailing 24-hour sliding window. On violation, emit `<refuse reason="rate-limited" retry-after="...">` and stop.
+3. **Check consent.** Consult the consent store for (field, origin, consent-scope):
+   - `explicit`: invoke the `ConsentHandler` callback to obtain affirmative, field-specific authorization from the principal. Block until answered.
+   - `implicit`: check the consent store for a prior standing grant matching (field, origin, scope). If none, treat as explicit.
+   - `authentication`: verify an authenticated session exists with the origin (via `AuthProvider`).
+   - `none`: no consent check, but trust policy still applies.
+   - On failure: emit `<refuse reason="user-denied">` or `<refuse reason="constraint-violation">` and stop.
+4. **Check trust policy.** Call `TrustPolicy::evaluate(origin, doc)`. On denial, emit `<refuse reason="trust-insufficient">` and stop.
+5. **Validate value.** If the `<ask>` declared `type`, `pattern`, or `one-of`, validate the answer value. On failure, emit `<refuse reason="unsupported-field">` and stop.
+6. **Tokenize if requested.** If the rule has `tokenize="true"`, replace the plaintext value with a structured token via the `Tokenizer` and set `tokenized="true"` on the `<answer>`.
+7. **Emit and audit.** Construct the `<answer>` with `field`, `value`, and `consent` basis. Record an audit entry: (field, origin, timestamp, consent basis, rule reference). Submit to the endpoint resolved via action binding.
 
-### FR-7: Knowledge Exchange — Response Building
-- The client MUST build agent response documents using the `anml` crate's `ResponseBuilder`.
-- The client MUST support emitting `<answer>`, `<refuse>`, `<ask>`, and `<inform>` elements.
-- `<answer>` MUST include `consent` attribute (explicit/implicit/delegated).
-- `<refuse>` MUST include `reason` from the RFC-defined set.
-- The client MUST support symmetric knowledge exchange (agent can also `<ask>` and `<inform>`).
+No step may be skipped. Additional checks (DLP, anomaly detection) MAY be inserted between steps.
 
-### FR-8: Flow Navigation
-- The client MUST track multi-step workflow state from `<state>/<flow>`.
-- The client MUST identify the current step, completed steps, and pending steps.
-- The client MUST support step transitions via action execution.
-- The client MUST support flow error recovery: `next-on-error` and `retry-budget` with exponential backoff.
+#### 1.4.1 Disclosure Matching Precedence
 
-### FR-9: Confidentiality Enforcement
-- The client MUST honor `confidentiality` on `<inform>`: `public`, `restricted`, `private`.
-- `private` content MUST NOT be forwarded to third parties.
-- `restricted` content SHOULD gate forwarding behind principal approval.
+When resolving which `<disclosure>` governs a field, the client MUST use this total order (ties broken by document order, first wins):
 
-### FR-10: Usage Rights
-- The client MUST read and expose `<rights>` declarations (holder, year, license, usage level).
-- The client MUST respect the usage hierarchy: `none < display < cache < store < train`.
-- The client MUST expose `<attribution>` requirements.
+1. Exact `field` attribute match.
+2. `field-prefix` match — longest prefix wins. `field-prefix="contact"` matches `contact`, `contact.email`, `contact.phone.home`, but NOT `contacts`.
+3. `field-pattern` match — fewest metacharacters wins; further ties by longest literal prefix before first metacharacter. Supported metacharacters: `*` (zero+ chars except `.`), `**` (zero+ chars including `.`), `?` (exactly one char except `.`). Backslash escapes literals.
+4. `default="true"` disclosure.
+5. If nothing matches: treat as `requires="explicit"` + `consent-scope="session"`.
 
-### FR-11: TTL & Caching
-- The client MUST respect `ttl` on `<anml>` root and `<inform>` elements.
-- The client SHOULD provide a document cache keyed by URL with TTL-based expiration.
+A `<disclosure>` MUST NOT carry both `field` and `field-prefix`, nor `field` and `field-pattern`, nor `field-prefix` and `field-pattern`.
 
-### FR-12: Error Handling
-- The client MUST parse `<status>` responses including `<problem>` children.
-- The client MUST map RFC problem type URIs to typed errors.
-- The client MUST handle HTTP-level errors (4xx, 5xx) gracefully.
+### 1.5 Action Execution
+- Execute actions from `<interact>` via the HTTP method and endpoint specified.
+- Implement the parameter binding algorithm (Section 10.9) for all three enctypes, with the following canonical form requirements critical for idempotency key stability:
 
-### FR-13: Subresource Integrity (SRI)
-- The client MUST verify `integrity` attributes on `<img>`, `<audio>`, `<video>`, and `<link>` elements when `inference="required"`.
-- The client MUST support `sha256` and `sha384` algorithms (minimum); `sha512` RECOMMENDED.
-- Integrity mismatches MUST prevent the resource from being used.
+#### 1.5.1 Parameter Binding Canonical Forms
 
-### FR-14: Pagination
-- The client MUST support `<nav>` elements for paginated results (next, prev, cursor, total).
-- The client SHOULD provide an iterator/stream abstraction over paginated data.
+**Parameter collection:** Walk `<action>` children in document order, collect each `<param>` as (name, value, type). Omit params whose `include` resolves to false. Strip leading/trailing ASCII whitespace from text content values.
 
-## Non-Functional Requirements
+**`application/x-www-form-urlencoded`:** Percent-encode name and value (space → `+`, unreserved set: `ALPHA / DIGIT / "-" / "." / "_" / "~"`). Emit `name=value` pairs joined by `&` in document order. Typed values use canonical lexical forms: XSD decimal for numbers, XSD boolean (`true`/`false`) for booleans, XSD dateTime for dates. `Content-Length` MUST equal the octet length of the body.
 
-### NFR-1: Async-First
-- The client MUST be async (`tokio`-based) by default.
-- A blocking convenience layer MAY be provided behind a feature flag.
+**`multipart/form-data`:** One part per param with `Content-Disposition: form-data; name="NAME"`. Boundary MUST be `anml-` + document `@id` + 96-bit cryptographically random suffix in base32-no-pad. Parts in document order. File params carry `filename` and `Content-Type`.
 
-### NFR-2: Dependency on `anml` Crate
-- The client MUST depend on the `anml` crate as a git dependency from the private `Life-Savor-AI/anml-server-rust` GitHub repository.
-- The dependency MUST be specified as `anml = { git = "https://github.com/Life-Savor-AI/anml-server-rust.git", features = ["serde"] }` (or SSH equivalent).
-- All client code MUST be self-contained in this repository. The `_reference/anml-server-rust` submodule is for reading/understanding only — not for path dependencies.
-- The client MUST NOT duplicate type definitions or parsing logic that the `anml` crate already provides.
+**`application/json`:** JSON object with members in document order (keys MUST NOT be sorted — this is critical for idempotency key stability). Duplicate names collected into arrays. Numbers as JSON numbers (IEEE-754 double precision; out-of-range as strings), booleans as JSON booleans, dateTime as RFC 3339 strings. Minified UTF-8, no BOM.
 
-### NFR-3: HTTP Client
-- The client SHOULD use `reqwest` as the HTTP backend.
-- The HTTP client MUST be configurable (timeouts, TLS, proxy, custom headers).
+#### 1.5.2 Endpoint URI Resolution
 
-### NFR-4: Ergonomic API
-- The client MUST provide a high-level `AnmlClient` struct as the primary entry point.
-- Common workflows (discover → fetch → inspect → act → respond) MUST be achievable in a few method calls.
-- Builder patterns for configuration.
+Relative `endpoint` URIs (e.g., `/airline`) MUST be resolved against the document's origin (scheme + host + port of the URL from which the document was fetched). If `xml:base` is declared on an ancestor element, it takes precedence per RFC 2396 / XML Base. Absolute URIs are used as-is but MUST still pass trust policy and SSRF checks.
 
-### NFR-5: Feature Flags
-- `dns-sd` — DNS service discovery (optional, adds DNS dependency).
-- `html-discovery` — HTML link element parsing (optional, adds HTML parser dependency).
-- `cache` — In-memory document/response caching.
+#### 1.5.3 `<ask>` Without `action` Attribute
+
+When an `<ask>` has no `action` attribute, the client MUST NOT attempt to submit an answer via HTTP. Instead:
+- The client MUST expose the ask to the consuming application as a "deferred ask" — the application is responsible for including the answer in a subsequent ANML document sent to the service via any agreed channel.
+- The `build_answer()` helper MUST still run disclosure evaluation for deferred asks.
+- The `ActionRequestBuilder` MUST NOT be usable for deferred asks (no action to bind to).
+
+- Validate parameters against type, required, pattern, min, max, and enum options.
+- Respect `auth` (none/required/optional) via pluggable auth provider, and `confirm` (invoke confirmation callback).
+- Support `Idempotency-Key` header generation (UUIDv4, ≥128 bits entropy) and RFC retry semantics.
+- Provide a fluent `ActionRequestBuilder` with typestate enforcement of required params at compile time.
+- Parameter setters accept `impl Into<String>`, `i64`, `f64`, `u64`, `bool` with automatic canonical form conversion.
+
+### 1.6 Knowledge Exchange
+- Build agent response documents using the `anml` crate's `ResponseBuilder`.
+- Support emitting `<answer>` (with `consent`), `<refuse>` (with `reason`), `<ask>`, and `<inform>`.
+- Support symmetric knowledge exchange (agent can also ask and inform).
+
+### 1.7 Flow Navigation
+- Track multi-step workflow state from `<state>/<flow>`.
+- Provide `current()`, `pending()`, `completed()`, `is_complete()` accessors.
+- Support step transitions via action execution.
+- Support flow error recovery: `next-on-error` and `retry-budget` with exponential backoff (1s base, 2x multiplier, cap 60s or TTL).
+- Detect state regressions (step moving backward) and surface as warnings.
+
+#### 1.7.1 Step `condition` Attribute
+
+The RFC defines a `condition` attribute on `<step>` but does not specify an expression language. The client MUST:
+- Expose `condition` as a raw `Option<String>` on the step accessor.
+- Provide a `ConditionEvaluator` callback trait that the consuming application can implement to evaluate conditions.
+- If no `ConditionEvaluator` is configured and a step has a `condition`, the client MUST treat the step as available (condition = true) and log a warning that the condition was not evaluated.
+- The `FlowNavigator` MUST call the evaluator before transitioning to a step with a condition; if the evaluator returns false, the step is skipped.
+
+### 1.8 Subresource Integrity (SRI)
+- Verify `integrity` attributes on `<img>`, `<audio>`, `<video>`, `<link>` when `inference="required"`.
+- Support `sha256`, `sha384` (minimum); `sha512` recommended. Select strongest when multiple tokens present.
+- Missing integrity on `inference="required"` = malformed document.
+- Integrity mismatches block resource use and log security events.
+
+### 1.9 Pagination
+- Support `<nav>` elements (next, prev, cursor, total).
+- Provide an async stream abstraction over paginated data.
+
+### 1.10 Confidentiality & Usage Rights
+- Honor `confidentiality` on `<inform>`: `private` MUST NOT be forwarded; `restricted` gates forwarding behind principal approval.
+- Expose `<rights>` (holder, year, license, usage level) and `<attribution>` via accessors.
+- Respect usage hierarchy: `none < display < cache < store < train`.
+
+### 1.11 TTL & Caching
+- Respect `ttl` on `<anml>` root and `<inform>` elements.
+- Provide a document cache keyed by URL with TTL-based expiration (feature-gated `cache`).
+
+### 1.12 Error Handling
+- Parse `<status>` responses including `<problem>` children.
+- Map RFC problem type URIs to typed error variants.
+- Handle HTTP-level errors (4xx, 5xx) gracefully.
+
+---
+
+## 2. Security Requirements (RFC §11)
+
+### 2.1 Transport Security
+- Default to HTTPS; HTTP requires explicit `allow_plaintext_http` opt-in.
+- Use `rustls` (pure Rust TLS), not system OpenSSL.
+- Refuse documents with `<constraints>`, `<interact>`, or `<ask requires="explicit">` when fetched over HTTP.
+
+### 2.2 XML Parsing Safety
+- Disable external DTD/entity resolution and XInclude (inherited from `anml` crate; client MUST NOT relax).
+- Parse to end-of-document before any externally observable action (no streaming consumption).
+
+### 2.3 Resource Limits
+Enforce RFC defaults (configurable but not disableable): 1 MiB doc size, 64 depth, 10k elements, 64 KiB attr value, 256 attrs/element, 256 KiB text/element, 64:1 entity expansion, 5s parse timeout, 1k disclosure rules, 1k knowledge primitives, 256 steps/flow. Decompression-aware; do not trust `Content-Length`.
+
+### 2.4 Action Safety
+- Verify endpoint URIs against trust policy before executing.
+- SSRF protection: reject private/loopback IPs (127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, ::1, fc00::/7).
+- Enforce per-document budgets: max distinct origins (5), max requests (50), max media fetches (20), max media bandwidth (50 MiB).
+- Require confirmation for `confirm="true"` actions and state-modifying actions at unfamiliar origins.
+
+### 2.5 Trust Policy
+- Provide `TrustPolicy` trait consulted before acting on any document.
+- Default: deny all origins unless explicitly allowed.
+- Disclosure algorithm step 4 invokes trust policy; denial emits `<refuse reason="trust-insufficient">`.
+
+### 2.6 Prompt Injection Defense
+- Treat `<persona>`, `<instructions>`, `<vocabulary>`, `<inform>`, and `<body>` text as untrusted data.
+- Expose as data, clearly labeled service-supplied. Principal intent always overrides.
+
+### 2.7 Tokenization
+- HMAC-SHA256 with per-client secret; tokens are hex-encoded, non-reversible, non-URL-safe, bound to (field, principal, origin).
+
+### 2.8 Cross-Origin Media Isolation
+- No credentials/cookies on cross-origin media fetches. Use isolated HTTP client.
+
+### 2.9 Extension Namespace Safety
+- Ignore unknown extensions per RFC.
+- Refuse documents declaring `<meta name="requires-ext">` for unrecognized extensions.
+
+### 2.10 Conformance Profile Handling
+- On document parse, scan `<meta name="profile">` entries.
+- The client MUST declare which profiles it implements (at minimum: `urn:ietf:anml:profile:core-1.0`).
+- If a document declares a profile the client does not implement, the client MUST refuse the document with an `unsupported-profile` problem naming the missing profile URI.
+- The client MUST NOT silently degrade when a required profile is missing.
+
+### 2.11 Audit Logging
+- Append-only audit log of disclosure events: field, origin, timestamp, consent basis, rule reference.
+- `AuditLog` trait for custom implementations; `InMemoryAuditLog` default.
+
+### 2.11 Privacy & Consent
+- Consent store with session/origin/global scoping; inspect, revoke, list.
+- `consent-scope="origin"` is binding across sibling origins.
+- Prefer tokenization when available for linkable fields.
+
+### 2.12 DoS Protection
+- Per-origin/per-document resource budgets.
+- Exponential backoff on `rate-limited`/`retry-after`.
+- All retry paths bounded.
+
+---
+
+## 3. Non-Functional Requirements
+
+### 3.1 Pure Rust
+- Entirely Rust; no external binaries or system commands.
+- DNS-SD via `hickory-resolver`, SRI via `sha2`, HTML parsing via `scraper`/`html5ever`, TLS via `rustls`.
+
+### 3.2 Async-First
+- `tokio`-based async by default. Blocking wrapper behind `blocking` feature flag.
+
+### 3.3 Dependency on `anml` Crate
+- Git dependency: `anml = { git = "https://github.com/Life-Savor-AI/anml-server-rust.git", features = ["serde"] }`.
+- `_reference/anml-server-rust` submodule is read-only reference. No path dependencies.
+- Do not duplicate types or parsing logic.
+
+### 3.4 Feature Flags
+- `dns-sd` — DNS service discovery.
+- `html-discovery` — HTML link element parsing.
+- `cache` — In-memory TTL document cache.
 - `blocking` — Synchronous API wrapper.
+- `testing` — Mock server, fixtures, assertion helpers.
+- `serde` (default) — Serde derives on client state types.
+- `wasm` (reserved, not v1) — Future WASM target support.
 
-### NFR-6: Pure Rust — No External Binaries or Services
-- The client MUST be implemented entirely in Rust. Third-party Rust crates are permitted.
-- The client MUST NOT shell out to external binaries, invoke system commands, or depend on external services for any of its functionality (e.g., no calls to `openssl` CLI, `dig`, `curl`, or similar).
-- DNS-SD resolution MUST use a pure-Rust DNS resolver (e.g., `hickory-resolver`), not system `dig`/`nslookup`.
-- SRI hashing MUST use pure-Rust crypto (e.g., `sha2` crate), not system `openssl`.
-- HTML parsing for discovery MUST use a pure-Rust parser (e.g., `scraper`/`html5ever`), not an external tool.
+### 3.5 MSRV
+- 1.80 (matching the `anml` crate).
 
-### NFR-7: MSRV
-- Minimum Supported Rust Version: 1.80 (matching the `anml` crate).
+---
 
-## Security Requirements
+## 4. Developer Experience Requirements
 
-The following requirements are derived from RFC Section 11 (Security Considerations) and Section 11a (Privacy Considerations). They define the security posture of a conforming ANML client.
+### 4.1 Ergonomic API
+- `AnmlClient` as primary entry point; `Clone + Send + Sync` (Arc-wrapped internals).
+- Common workflows (discover → fetch → inspect → act → respond) in a few method calls.
+- Builder patterns for configuration.
+- Prelude module re-exporting core types for 90% of use cases.
+- Document that users should create one client and share it (connection pooling).
 
-### SR-1: Transport Security (RFC §11.13)
-- The client MUST default to HTTPS. HTTP MUST require explicit opt-in via configuration (`allow_plaintext_http`).
-- The client MUST refuse to process documents containing `<constraints>`, `<interact>`, or `<ask requires="explicit">` when retrieved over unencrypted HTTP.
-- The client MUST use `rustls` (pure Rust TLS) by default for TLS, not system OpenSSL.
+### 4.2 Actionable Errors
+- Every error variant includes contextual fields. Messages phrased as "expected X, got Y" or "field 'Z' requires W".
+- Disclosure errors: field, rule, requires, scope, failure reason.
+- Param validation errors: param name, constraint, actual value.
+- Action errors: action id, method, endpoint, HTTP status.
 
-### SR-2: Content-Type Downgrade Prevention (RFC §11.14)
-- The client MUST verify that the response `Content-Type` begins with `application/anml+xml` before parsing.
-- The client MUST NOT attempt to "upgrade-parse" non-ANML payloads (e.g., HTML, JSON) as ANML documents.
-- On Content-Type mismatch, the client MUST return a typed error and MUST NOT pass the body to the XML parser.
+### 4.3 Display & Debug
+- `AnmlDocument` `Display`: concise summary (title, version, ask/action counts, flow step, status).
+- `AnmlClientError` `Display`: single-line actionable messages.
+- All public types implement `Debug`.
 
-### SR-3: XML Parsing Attack Mitigation (RFC §11.5)
-- The client MUST disable external DTD subset resolution, external parameter entity resolution, external general entity resolution, and XInclude processing. (Inherited from the `anml` crate's parser, but the client MUST verify these are enforced and MUST NOT override them.)
-- The client MUST NOT configure the `anml` parser in a way that relaxes these protections.
+### 4.4 Comprehensive Timeouts
+- Per-request (30s), per-action (60s), per-flow (5min), per-media-fetch (15s), parse (5s).
+- Flow exceeding total timeout aborts with `FlowAborted`.
 
-### SR-4: Resource Limits (RFC §11.6)
-The client MUST enforce the following default limits (configurable upward/downward, but MUST NOT be disabled entirely):
+### 4.5 Type Conversions
+- Param setters accept `impl Into<String>`, `i64`, `f64`, `u64`, `bool`.
+- Consent basis settable via enum or `&str`.
 
-| Limit | Default |
-|-------|---------|
-| Maximum document size (post-decompression) | 1 MiB |
-| Maximum element nesting depth | 64 |
-| Maximum element count | 10,000 |
-| Maximum attribute value length | 64 KiB |
-| Maximum attributes per element | 256 |
-| Maximum text-content length per element | 256 KiB |
-| Maximum entity expansion ratio | 64:1 |
-| Maximum parse wall-clock time | 5 s |
-| Maximum `<disclosure>` rules per document | 1,000 |
-| Maximum `<ask>` + `<answer>` + `<refuse>` per document | 1,000 |
-| Maximum `<step>` per `<flow>` | 256 |
+### 4.6 Semver & Non-Exhaustive
+- Strict semver. `#[non_exhaustive]` on all public enums and config structs.
+- `CHANGELOG.md` following Keep a Changelog format.
 
-- When a document is received compressed (Content-Encoding: gzip/br), the size limit applies to the decompressed length. The client MUST halt decompression at the limit.
-- The client MUST NOT rely on `Content-Length` for security; limits are enforced on the actual byte stream.
+### 4.7 `no_std` Core (Future)
+- Disclosure engine, consent store, param validation as pure functions with no I/O.
+- Architecture must not prevent future `anml-client-core` extraction.
 
-### SR-5: No Streaming Consumption (RFC §11.7)
-- The client MUST parse a document to end-of-document before executing any action, emitting any `<answer>`, `<refuse>`, or outbound `<ask>`.
-- This holds even when the HTTP body arrives in chunks.
-- Internal incremental parsing is permitted, but no externally observable action may occur before end-of-document.
+---
 
-### SR-6: Prompt Injection / Behavioral Manipulation Defense (RFC §11.3)
-- The client MUST treat content in `<persona>`, `<instructions>`, `<vocabulary>`, `<inform>`, and free-text `<body>` as untrusted data, not as executable instructions.
-- The client MUST NOT honor directives within these elements to ignore constraints, disclose secrets, modify security policy, or execute actions not defined in `<interact>`.
-- The client MUST expose these elements as data to the consuming application, clearly labeled as service-supplied and untrusted.
-- Principal (user) intent MUST always override document-supplied behavioral guidance.
+## 5. Operational Requirements
 
-### SR-7: Action Execution Safety (RFC §11.4)
-- The client MUST resolve action `endpoint` URIs and verify them against the configured trust policy before executing.
-- The client MUST require principal confirmation for actions with `confirm="true"`.
-- The client SHOULD require confirmation for any state-modifying action (POST/PUT/PATCH/DELETE) at an unfamiliar origin.
-- The client MUST NOT execute an action that would violate a constraint the principal has declared.
-- The client MUST enforce a configurable limit on the number of distinct origins that actions in a single document may target (default: 5). Documents exceeding this limit MUST be refused.
-- The client MUST enforce a configurable limit on the total number of HTTP requests generated from a single document (default: 50).
+### 5.1 Observability
+- `tracing` integration at all key decision points with span context.
+- Sensitive values not logged above TRACE. Security events at WARN/ERROR.
 
-### SR-8: Trust Policy (RFC §11.9)
-- The client MUST provide a `TrustPolicy` trait that is consulted before acting on any document.
-- The default trust policy MUST deny all origins unless explicitly allowed.
-- Trust policy inputs SHOULD include: origin (scheme/host/port), TLS certificate status, user allow/deny lists.
-- The disclosure algorithm (step 4) MUST invoke the trust policy; if it denies, the client MUST emit `<refuse reason="trust-insufficient">`.
+### 5.2 HTTP Middleware
+- Composable request/response interceptors via `HttpMiddleware` trait.
 
-### SR-9: Cross-Origin Media Isolation (RFC §11.12)
-- When fetching media referenced by `<img>`, `<audio>`, `<video>`, or `<link>`, the client MUST NOT attach credentials, cookies, or principal identifiers to cross-origin requests unless the principal has explicitly authorized it.
-- The client MUST enforce a configurable limit on the number of media resources fetched per document (default: 20) and total media bandwidth per document (default: 50 MiB).
+### 5.3 Retry & Circuit Breaker
+- Configurable retry policy for transient HTTP errors (3 retries, 1s base, 2x, 30s cap).
+- Per-origin circuit breaker (5 failures, 60s cooldown).
+- Independent of ANML-level `retry-budget`.
 
-### SR-10: Tokenization Security (RFC §11.15)
-- When `tokenize="true"` is set on a disclosure rule, the client MUST generate structured tokens that are:
-  - Collision-resistant
-  - Bound to the (field, principal, origin) tuple
-  - Non-reversible outside the agent's trust boundary
-- Tokens MUST be generated using a cryptographically secure mechanism (e.g., HMAC-SHA256 with a per-client secret key).
-- Tokens MUST NOT encode persistent principal identifiers in a form observable to the receiving service.
-- Tokens MUST NOT be URL-safe in a way that allows trivial reuse as identifiers in downstream calls.
+### 5.4 Authentication Provider
+- `AuthProvider` trait: bearer tokens, API keys, custom headers, async token refresh.
+- Credentials never sent to uncovered origins. On 401, call `on_unauthorized()` and retry once.
 
-### SR-11: Idempotency Key Security (RFC §8.6.1)
-- Idempotency keys MUST be generated as UUIDv4 or equivalent with at least 128 bits of entropy.
-- Keys MUST be scoped to the (action id, ask set) tuple.
-- On network-level failure, the client MUST retry with the same key.
-- On application-level error, the client MUST NOT retry with the same key unless the error is explicitly retriable (`retry-after` or `transient` problem type).
+### 5.5 State Persistence
+- `ConsentStore`, `AuditLog`, `FlowNavigator` serializable via serde (behind `serde` flag).
+- `export_state()` / `restore_state()` for cross-restart persistence.
 
-### SR-12: Disclosure Audit Logging (RFC §11.16 operational)
-- The client MUST maintain an append-only audit log of disclosure events.
-- Each audit entry MUST contain at minimum: field, service origin, timestamp, consent basis, and disclosure rule reference.
-- The audit log MUST be accessible to the principal for inspection.
-- The client SHOULD provide a callback/trait for custom audit log implementations.
+### 5.6 Testing Support (feature-gated `testing`)
+- `MockAnmlServer` — in-process HTTP server with configurable responses and request recording.
+- Pre-built fixture documents for common patterns.
+- Assertion helpers for disclosure, consent, and action params.
 
-### SR-13: Extension Namespace Safety (RFC §11.15)
-- The client MUST silently ignore unknown extension elements and attributes per the RFC.
-- If a document declares `<meta name="requires-ext" value="...">` for an extension the client does not support, the client MUST refuse the document with an `unsupported-profile` problem rather than silently degrading.
+---
 
-### SR-14: Replay and State Integrity
-- The client MUST NOT blindly trust `<state>` values from a service response without validating them against the expected flow progression.
-- The client SHOULD detect unexpected state regressions (e.g., a step moving from "completed" back to "pending") and surface them to the principal.
+## 6. Testing Requirements
 
-### SR-15: Denial of Service Protection (RFC §11.11)
-- The client MUST enforce per-origin and per-document resource budgets (request count, bandwidth, parse time).
-- The client MUST implement exponential backoff when encountering `rate-limited` refusals or `retry-after` status responses.
-- The client MUST NOT enter unbounded retry loops; all retry paths MUST be bounded by `retry-budget` or a configurable maximum.
+### 6.1 Property-Based Testing
+`proptest` for: disclosure matching precedence, parameter binding determinism, rate limit sliding windows, consent store scoping, glob pattern matching.
 
-### SR-16: Privacy — Consent Management
-- The client MUST provide the principal with the ability to inspect outstanding standing consents, revoke them individually or in bulk, and view a history of disclosures per origin and per field.
-- `consent-scope="origin"` MUST be binding: disclosure to one origin MUST NOT authorize disclosure to a sibling origin.
-- The client SHOULD prefer `tokenize="true"` when available for fields whose plaintext would be linkable across origins.
+### 6.2 Integration Tests
+Full lifecycle via `MockAnmlServer`: happy path, multi-step flow, disclosure gates, error paths (406, integrity, SSRF, trust denial), pagination.
 
-### SR-17: Privacy — Confidentiality Labels (RFC §11a.5)
-- `confidentiality="private"` on `<inform>` MUST prevent the client from forwarding that content to any third party.
-- `confidentiality="restricted"` SHOULD gate forwarding behind principal approval.
-- The client MAY enforce tighter handling than the service requested.
+### 6.3 Compile-Fail Tests
+`trybuild` verifying typestate enforcement: missing required param = compile error.
 
-## Operational Requirements
-
-### OR-1: Observability
-- The client MUST integrate with the `tracing` crate for structured logging at all key decision points: fetch, parse, disclosure evaluation, action execution, retry, flow transitions, and security events.
-- Log events MUST include span context (origin, document URL, action id, field) for correlation.
-- The client MUST NOT log sensitive values (answer values, tokens, credentials) at any level below `TRACE`.
-- Security-relevant events (trust denials, integrity mismatches, SSRF blocks, transport rejections) MUST be logged at `WARN` or `ERROR`.
-
-### OR-2: HTTP Middleware Hooks
-- The client MUST support request/response interceptors via a middleware trait, allowing users to inspect or modify HTTP requests before dispatch and responses before parsing.
-- Use cases: custom auth header injection, request signing, logging, metrics collection, header rewriting.
-- Middleware MUST be composable (multiple interceptors in a chain).
-
-### OR-3: Retry & Resilience
-- The client MUST support a configurable retry policy for transient HTTP errors (5xx, connection reset, timeout) independent of ANML-level `retry-budget`.
-- Default: 3 retries with exponential backoff (1s base, 2x multiplier, 30s cap).
-- The client SHOULD implement per-origin circuit breaking: after N consecutive failures (configurable, default 5), the client MUST short-circuit requests to that origin for a cooldown period (configurable, default 60s) before attempting again.
-
-### OR-4: Authentication Provider
-- The client MUST provide a pluggable `AuthProvider` trait for supplying credentials to actions with `auth="required"` or `auth="optional"`.
-- The trait MUST support: bearer tokens, API keys (header or query), and custom header injection.
-- The trait SHOULD support async token refresh (e.g., OAuth2 token rotation).
-- The client MUST NOT send credentials to origins not covered by the auth provider.
-
-### OR-5: Testing Support
-- The client crate MUST ship a `testing` module (feature-gated) providing:
-  - `MockAnmlServer` — an in-process HTTP server that serves configurable ANML documents and records received requests/responses.
-  - Pre-built fixture documents covering common patterns: simple fetch, multi-step flow, disclosure-gated ask, paginated data, error/problem responses.
-  - Assertion helpers for verifying disclosure decisions, action parameters, and consent state.
-
-### OR-6: State Persistence
-- The `ConsentStore`, `AuditLog`, and `FlowNavigator` state MUST be serializable via `serde` (behind the `serde` feature flag).
-- This enables users to persist client state across process restarts (e.g., standing consents, audit history, in-progress flow state).
-- The client MUST support constructing from previously serialized state.
-
-### OR-7: Ergonomic Action Builder
-- The client MUST provide a fluent `ActionRequestBuilder` for constructing action executions:
-  ```
-  client.action(&doc, "submit-airline")
-      .param("airline", "Delta")
-      .param("seat", "12A")
-      .execute().await?;
-  ```
-- Parameter validation (type, required, pattern, enum) MUST occur at `execute()` time with clear error messages referencing the `<param>` definition.
-
-### OR-8: WASM Compatibility (Future)
-- The client architecture MUST NOT take dependencies that preclude future `wasm32-unknown-unknown` compilation.
-- A `wasm` feature flag SHOULD be reserved (not implemented in v1) that swaps `reqwest`'s native backend for its WASM backend and disables `tokio`-specific features.
-- File I/O, system time, and OS-level randomness MUST be abstracted behind traits so WASM targets can provide alternatives.
-
-## Developer Experience Requirements
-
-### DX-1: Actionable Error Messages
-- Every error variant MUST include enough context for the developer to understand what went wrong and what to do about it without reading source code.
-- Disclosure errors MUST include: the field name, the governing disclosure rule, what the rule required, and the reason it failed.
-- Parameter validation errors MUST include: the param name, the expected constraint (type, pattern, enum values, min/max), and the actual value provided.
-- Action execution errors MUST include: the action id, the HTTP method, the endpoint, and the HTTP status or network error.
-- All error messages MUST be phrased as "expected X, got Y" or "field 'Z' requires W" — never bare "validation failed" or "error occurred".
-
-### DX-2: Compile-Time Safety via Typestate
-- `ActionRequestBuilder` MUST use typestate pattern to enforce required parameters at compile time.
-- If an action's `<param>` has `required="true"`, the builder MUST NOT expose `.execute()` until that param has been set.
-- This is implemented via generic type parameters that track which required params have been provided, so missing a required param is a compile error, not a runtime error.
-
-### DX-3: Useful Display and Debug Implementations
-- `AnmlDocument` MUST implement `Display` with a human-readable summary: title, origin, version, number of asks, number of actions, current flow step (if any), and status.
-- All public types MUST implement `Debug`.
-- `Display` on error types MUST produce single-line messages suitable for log output.
-- `Debug` on document types MAY be verbose (full tree), but `Display` MUST be concise.
-
-### DX-4: Comprehensive Timeouts
-- The client MUST support configurable timeouts at every level:
-  - Per-request timeout (individual HTTP call, default 30s)
-  - Per-action timeout (including retries, default 60s)
-  - Per-flow total timeout (entire multi-step flow, default 5 minutes)
-  - Per-media-fetch timeout (individual resource fetch, default 15s)
-  - Parse timeout (already specified in SR-4, default 5s)
-- A flow that exceeds its total timeout MUST be aborted with a `FlowAborted` error regardless of individual step success.
-
-### DX-5: Ergonomic Type Conversions
-- Parameter setters MUST accept `impl Into<String>` for string values, not just `&str`.
-- Numeric parameters MUST accept `i64`, `f64`, and `u64` directly with automatic canonical form conversion.
-- Boolean parameters MUST accept `bool` directly.
-- Consent basis MUST be settable via the enum or via `&str` (with validation).
-- All builder methods MUST accept the most natural Rust type for the value being set.
-
-### DX-6: Prelude Module
-- The crate MUST provide an `anml_client::prelude` module that re-exports the types needed for 90% of use cases.
-- Prelude MUST include at minimum: `AnmlClient`, `ClientConfig`, `AnmlClientError`, `Result`, `ConsentBasis`, `TrustPolicy`, `AllowListTrustPolicy`, `ActionRequestBuilder`, `FlowNavigator`, and key `anml` crate re-exports (`AnmlDocument`, `AnmlAction`, `AnmlAsk`, `AnmlAnswer`, `AnmlRefuse`).
-
-### DX-7: Connection Pooling and Client Sharing
-- `AnmlClient` MUST be `Clone`, `Send`, and `Sync` (wrapping internals in `Arc` as needed).
-- Documentation MUST explicitly state that users should create one `AnmlClient` and share it across tasks/threads, not create a new client per request.
-- The underlying `reqwest::Client` connection pool MUST be shared across all requests from the same `AnmlClient` instance.
-
-### DX-8: Semver, Non-Exhaustive, and Changelog
-- The crate MUST follow strict semver.
-- All public enums and config structs MUST use `#[non_exhaustive]` (matching the `anml` server crate convention) to allow adding variants/fields in minor versions.
-- The crate MUST ship a `CHANGELOG.md` following Keep a Changelog format.
-- Breaking changes MUST only occur in major version bumps.
-
-### DX-9: `no_std` Core (Future)
-- The disclosure engine, consent store, parameter validation, and disclosure matching logic MUST be implemented as pure functions with no I/O dependencies.
-- The architecture MUST NOT prevent extracting these into a future `anml-client-core` crate that is `no_std` compatible for embedded agents.
-- This is a design constraint, not a v1 deliverable.
-
-## Testing Requirements
-
-### TR-1: Property-Based Testing
-- The client MUST use `proptest` for property-based testing of all algorithmic logic.
-- The following MUST have property-based tests:
-  - Disclosure matching (field, field-prefix, field-pattern, default, precedence) — arbitrary field names and disclosure rule sets must produce deterministic, correct matches per RFC precedence.
-  - Parameter binding algorithm — arbitrary param sets must produce valid urlencoded, multipart, and JSON bodies that round-trip correctly.
-  - Rate limit tracking — arbitrary sequences of disclosure events must correctly enforce 24-hour sliding windows.
-  - Consent store scoping — arbitrary grant/revoke sequences across session/origin/global scopes must maintain correct state.
-  - Glob pattern matching — arbitrary patterns and field names must match identically to a reference implementation.
-
-### TR-2: Integration Tests with Mock Server
-- The client MUST have integration tests using the `MockAnmlServer` from the `testing` module.
-- Integration tests MUST cover the full lifecycle: discover → fetch → inspect → disclose → execute → parse response → advance flow.
-- Integration tests MUST cover error paths: 406 version mismatch, 401 auth required, integrity mismatch, transport insecurity rejection, trust denial, rate limiting.
-
-### TR-3: Compile-Fail Tests
-- The client MUST use `trybuild` for compile-fail tests verifying typestate enforcement.
-- Tests MUST verify that calling `.execute()` without setting required params produces a compile error.
-
-### TR-4: Test Coverage
-- The crate SHOULD target >90% line coverage on non-trivial logic (disclosure, matching, params, flow, security).
-- Coverage MUST be measurable via `cargo-tarpaulin` or `cargo-llvm-cov`.
+### 6.4 Coverage
+Target >90% line coverage on non-trivial logic. Measurable via `cargo-tarpaulin` or `cargo-llvm-cov`.
