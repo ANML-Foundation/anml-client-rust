@@ -95,8 +95,17 @@ let response = client.execute_action(&doc, "submit-airline", &[
 
 The `execute_action` and `answer` methods MUST run the disclosure algorithm before emitting any `<answer>`. The client maintains a `ConsentStore` that tracks consent grants by scope (session/origin/global).
 
+The 7-step algorithm (RFC §8.5) is executed for every answer:
+
+1. **Resolve the rule** — match field against `<disclosure>` rules using precedence: exact `field` > `field-prefix` (longest) > `field-pattern` (fewest metacharacters) > `default="true"`. No match → synthesize `requires="explicit"` + `consent-scope="session"`, log warning.
+2. **Check rate limit** — if rule has `rate-limit`, verify (field, origin) hasn't exceeded the 24h sliding window. Violation → `<refuse reason="rate-limited">`.
+3. **Check consent** — consult `ConsentStore` for (field, origin, scope). `explicit` → invoke `ConsentHandler` callback (blocks). `implicit` → check store. `authentication` → verify via `AuthProvider`. `none` → skip but trust policy still applies. Failure → `<refuse reason="user-denied">`.
+4. **Check trust policy** — call `TrustPolicy::evaluate(origin, doc)`. Denial → `<refuse reason="trust-insufficient">`.
+5. **Validate value** — check against `<ask>` type/pattern/one-of. Failure → `<refuse reason="unsupported-field">`.
+6. **Tokenize if requested** — if `tokenize="true"`, replace value via `Tokenizer`, set `tokenized="true"`.
+7. **Emit and audit** — construct `<answer>` with consent basis, record audit entry (field, origin, timestamp, basis, rule).
+
 ```rust
-// The consent callback is how the client asks the principal
 let client = AnmlClient::builder()
     .consent_handler(|field, disclosure| {
         // Return ConsentDecision::Grant or ConsentDecision::Deny
@@ -104,20 +113,33 @@ let client = AnmlClient::builder()
     .build()?;
 ```
 
-For `requires="explicit"`, the consent handler is always called. For `requires="implicit"`, the client checks the consent store first. For `requires="none"`, no consent is needed (but trust policy may still block).
-
 ### 4. Action execution encapsulates the full RFC flow
 
 `client.execute_action()` does:
 1. Resolve the `<action>` by id from `<interact>`
-2. Collect and validate parameters against `<param>` definitions
-3. Run disclosure evaluation for any `<answer>` values being sent
-4. Serialize the request body per the action's `enctype` using the parameter binding algorithm
-5. If `confirm="true"`, invoke the confirm callback
-6. If `idempotent="true"`, generate and attach `Idempotency-Key`
-7. Perform the HTTP request
-8. Parse the response as an ANML document
-9. Return the parsed response
+2. Resolve the endpoint URI: relative URIs resolve against the document's origin (scheme+host+port). `xml:base` on an ancestor takes precedence per XML Base. Absolute URIs used as-is but still pass trust policy + SSRF checks.
+3. Collect and validate parameters against `<param>` definitions
+4. Run disclosure evaluation for any `<answer>` values being sent
+5. Serialize the request body per the action's `enctype` using the parameter binding algorithm (canonical forms below)
+6. If `confirm="true"`, invoke the confirm callback
+7. If `idempotent="true"`, generate and attach `Idempotency-Key`
+8. Perform the HTTP request
+9. Parse the response as an ANML document
+10. Return the parsed response
+
+#### Parameter Binding Canonical Forms
+
+These are critical for idempotency key stability — same input MUST produce identical bytes.
+
+**urlencoded:** space→`+`, unreserved set `ALPHA/DIGIT/-._~`, pairs joined by `&` in document order. Typed values: XSD decimal (numbers), XSD boolean `true`/`false`, XSD dateTime (dates).
+
+**multipart:** boundary = `anml-` + doc `@id` + 96-bit crypto random (base32-no-pad). Parts in document order.
+
+**JSON:** keys in document order (MUST NOT sort — idempotency depends on this). Numbers as JSON numbers (IEEE-754 double; out-of-range as strings), booleans as JSON booleans, dateTime as RFC 3339. Minified UTF-8, no BOM.
+
+#### Deferred Asks (`<ask>` without `action`)
+
+When an `<ask>` has no `action` attribute, the client exposes it as a "deferred ask" — no HTTP submission. The consuming application includes the answer in a subsequent document. `build_answer()` still runs disclosure evaluation. `ActionRequestBuilder` is not usable for deferred asks.
 
 ### 5. Flow navigation is stateful
 
@@ -132,6 +154,14 @@ let next_doc = flow.advance(&[("reason", "damaged")]).await?;
 ```
 
 The `FlowNavigator` tracks step state, handles `next-on-error` transitions, and enforces `retry-budget` with exponential backoff.
+
+#### Step Conditions
+
+`<step condition="...">` is exposed as `Option<String>`. A `ConditionEvaluator` callback trait lets the application evaluate conditions. If no evaluator is configured and a step has a condition, the step is treated as available (condition=true) with a warning logged. The evaluator is called before transitioning; if it returns false, the step is skipped.
+
+### 6. Conformance Profile Handling
+
+On parse, the client scans `<meta name="profile">` entries. The client declares which profiles it implements (at minimum `core-1.0`). If a document requires a profile the client doesn't implement, the document is refused with `UnsupportedProfile` error. No silent degradation.
 
 ### 6. Pagination as an async stream
 
